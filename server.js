@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import cron from "node-cron";
 dotenv.config();
 
 // Debug: print env vars on startup
@@ -20,7 +21,8 @@ import "./config/passport.js";
 import passport from "passport";
 import authRoutes from "./routes/auth.js";
 import expenseRoutes from "./routes/expenses.js";
-
+import User from "./models/User.js"; // adjust path to match your actual User model
+import { sendDailyReportForUser } from "./services/dailyReport.js";
 const app = express();
 
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
@@ -45,7 +47,25 @@ app.use((req, res, next) => {
 app.use("/auth", authRoutes);
 app.use("/api/expenses", expenseRoutes);
 app.get("/health", (req, res) => res.json({ status: "ok", version: "2.0.0" }));
-
+cron.schedule(
+  "0 20 * * *",
+  async () => {
+    console.log("Running daily expense report job...");
+    try {
+      const users = await User.find({ sheetId: { $exists: true, $ne: null } });
+      for (const user of users) {
+        try {
+          await sendDailyReportForUser(user);
+        } catch (err) {
+          console.error(`Failed for ${user.email}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error("Cron job error:", err.message);
+    }
+  },
+  { timezone: "Asia/Kolkata" }
+);
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
