@@ -1,13 +1,26 @@
 import axios from "axios";
-import Expense from "../models/Expense.js";
+import { getSheetRows } from "../config/sheets.js";
 
-function buildTodaySummary(expenses, todayStr) {
-  const todayEntries = expenses.map((e) => ({
-    item: e.item || "",
-    category: e.category || "",
-    amount: parseFloat(e.amount) || 0,
+function parseDate(dateStr) {
+  if (!dateStr) return null;
+  const [day, month, year] = dateStr.split("/");
+  if (!day || !month || !year) return null;
+  return new Date(`${year}-${month}-${day}`);
+}
+
+function buildTodaySummary(rows) {
+  const data = rows.slice(1).map((row) => ({
+    date: row[0] || "",
+    item: row[1] || "",
+    category: row[2] || "",
+    amount: parseFloat(row[3]) || 0,
   }));
 
+  const todayStr = new Date().toLocaleDateString("en-IN", {
+    timeZone: "Asia/Kolkata", day: "2-digit", month: "2-digit", year: "numeric",
+  });
+
+  const todayEntries = data.filter((d) => d.date === todayStr);
   const total = todayEntries.reduce((sum, e) => sum + e.amount, 0);
 
   return { todayStr, todayEntries, total };
@@ -26,17 +39,12 @@ function formatMessage({ todayStr, todayEntries, total }) {
 }
 
 export async function sendDailyReportForUser(user) {
-  const todayStr = new Date().toLocaleDateString("en-IN", {
-    timeZone: "Asia/Kolkata", day: "2-digit", month: "2-digit", year: "numeric",
-  });
+  if (!user.sheetId) return;
 
-  // Mongo query replaces the live Sheets read — filters directly by
-  // userId + date instead of pulling every row and filtering in JS.
-  const todayExpenses = await Expense.find({ userId: user._id, date: todayStr }).lean();
+  const rows = await getSheetRows(user.accessToken, user.refreshToken, user.sheetId);
+  if (!rows || rows.length <= 1) return;
 
-  if (!todayExpenses.length) return;
-
-  const summary = buildTodaySummary(todayExpenses, todayStr);
+  const summary = buildTodaySummary(rows);
   const message = formatMessage(summary);
 
   try {

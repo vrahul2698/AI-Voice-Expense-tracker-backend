@@ -3,8 +3,7 @@ import multer from "multer";
 import fs from "fs";
 import Groq from "groq-sdk";
 import { requireAuth } from "../middleware/auth.js";
-import { appendExpenseRow } from "../config/sheets.js";
-import Expense from "../models/Expense.js";
+import { appendExpenseRow, getSheetRows } from "../config/sheets.js";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -59,17 +58,16 @@ function parseDate(dateStr) {
   return new Date(`${year}-${month}-${day}`);
 }
 
-// ─── Helper: Build analytics from expense documents ──────────────────────────
-// Same logic as before — only the input shape changed (Mongo documents
-// instead of raw sheet rows), so all aggregation math below is untouched.
-function buildAnalytics(expenses) {
-  const data = expenses.map((e) => ({
-    date: e.date || "",
-    item: e.item || "",
-    category: e.category || "",
-    amount: parseFloat(e.amount) || 0,
-    originalText: e.originalText || "",
-    loggedAt: e.loggedAt || "",
+// ─── Helper: Build analytics from sheet rows ─────────────────────────────────
+function buildAnalytics(rows) {
+  // Skip header row
+  const data = rows.slice(1).map((row) => ({
+    date: row[0] || "",
+    item: row[1] || "",
+    category: row[2] || "",
+    amount: parseFloat(row[3]) || 0,
+    originalText: row[4] || "",
+    loggedAt: row[5] || "",
   }));
 
   // ── Daily totals ──────────────────────────────────────────────────────────
@@ -189,39 +187,6 @@ function buildAnalytics(expenses) {
   };
 }
 
-// ─── Helper: save to Mongo, respond, then sync to Sheets in the background ───
-// Centralizes the "Mongo first, Sheets second" pattern used by both
-// /audio and /text so the logic isn't duplicated.
-async function saveExpenseAndSync(req, res, extracted, originalText) {
-  console.log(req.user._id, extracted, originalText);
-  const expense = await Expense.create({
-    userId: req.user._id,
-    item: extracted.item,
-    category: extracted.category,
-    amount: Number(extracted.amount) || 0,
-    date: extracted.date,
-    originalText,
-  });
-
-  req.user.totalExpenses += 1;
-  req.user.totalAmount += Number(extracted.amount) || 0;
-  await req.user.save();
-console.log("MONGO SAVE SUCCESS:", expense._id);
-  // Respond immediately — the user doesn't wait on the Google Sheets round-trip.
-  res.json({ success: true, transcription: originalText, expense: extracted });
-
-  // Sync to Sheets afterward, in the background. Failures here are logged,
-  // not surfaced to the user, since Mongo is now the source of truth.
-  appendExpenseRow(req.user.accessToken, req.user.refreshToken, req.user.sheetId, {
-    ...extracted,
-    originalText,
-  })
-    .then(() => Expense.findByIdAndUpdate(expense._id, { sheetRowSynced: true }))
-    .catch((err) =>
-      console.error(`Sheet sync failed for expense ${expense._id}:`, err.message)
-    );
-}
-
 // ─── POST /api/expenses/audio ─────────────────────────────────────────────────
 router.post("/audio", requireAuth, upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio file" });
@@ -247,7 +212,18 @@ router.post("/audio", requireAuth, upload.single("audio"), async (req, res) => {
       return res.json({ success: false, transcription: spokenText, message: "Could not detect an expense." });
     }
 
-    await saveExpenseAndSync(req, res, extracted, spokenText);
+    const row = await appendExpenseRow(
+      req.user.accessToken,
+      req.user.refreshToken,
+      req.user.sheetId,
+      { ...extracted, originalText: spokenText }
+    );
+
+    req.user.totalExpenses += 1;
+    req.user.totalAmount += Number(extracted.amount) || 0;
+    await req.user.save();
+
+    res.json({ success: true, transcription: spokenText, expense: extracted, sheetRow: row });
   } catch (err) {
     console.error("Audio error:", err.message);
     res.status(500).json({ error: err.message });
@@ -269,23 +245,30 @@ router.post("/text", requireAuth, async (req, res) => {
       return res.json({ success: false, transcription: text, message: "Could not detect an expense." });
     }
 
-    await saveExpenseAndSync(req, res, extracted, text);
+    const row = await appendExpenseRow(
+      req.user.accessToken,
+      req.user.refreshToken,
+      req.user.sheetId,
+      { ...extracted, originalText: text }
+    );
+
+    req.user.totalExpenses += 1;
+    req.user.totalAmount += Number(extracted.amount) || 0;
+    await req.user.save();
+
+    res.json({ success: true, transcription: text, expense: extracted, sheetRow: row });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─── GET /api/expenses ── raw rows ────────────────────────────────────────────
-// Now reads from MongoDB instead of live Sheets rows. Capped with .limit()
-// so "give me everything" can't silently grow unbounded as history builds up.
 router.get("/", requireAuth, async (req, res) => {
-  try {
-    const expenses = await Expense.find({ userId: req.user._id })
-      .sort({ date: -1, loggedAt: -1 })
-      .limit(100)
-      .lean();
+  if (!req.user.sheetId) return res.json({ rows: [] });
 
-    res.json({ success: true, expenses });
+  try {
+    const rows = await getSheetRows(req.user.accessToken, req.user.refreshToken, req.user.sheetId);
+    res.json({ success: true, rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -293,14 +276,18 @@ router.get("/", requireAuth, async (req, res) => {
 
 // ─── GET /api/expenses/analytics ── full analytics ───────────────────────────
 router.get("/analytics", requireAuth, async (req, res) => {
-  try {
-    const expenses = await Expense.find({ userId: req.user._id }).lean();
+  if (!req.user.sheetId) {
+    return res.json({ success: true, analytics: null, message: "No sheet linked" });
+  }
 
-    if (!expenses.length) {
+  try {
+    const rows = await getSheetRows(req.user.accessToken, req.user.refreshToken, req.user.sheetId);
+
+    if (!rows || rows.length <= 1) {
       return res.json({ success: true, analytics: null, message: "No expenses yet" });
     }
 
-    const analytics = buildAnalytics(expenses);
+    const analytics = buildAnalytics(rows);
     res.json({ success: true, analytics });
   } catch (err) {
     console.error("Analytics error:", err.message);
@@ -310,9 +297,11 @@ router.get("/analytics", requireAuth, async (req, res) => {
 
 // ─── GET /api/expenses/analytics/daily ── just daily breakdown ───────────────
 router.get("/analytics/daily", requireAuth, async (req, res) => {
+  if (!req.user.sheetId) return res.json({ success: true, daily: [] });
+
   try {
-    const expenses = await Expense.find({ userId: req.user._id }).lean();
-    const { daily } = buildAnalytics(expenses);
+    const rows = await getSheetRows(req.user.accessToken, req.user.refreshToken, req.user.sheetId);
+    const { daily } = buildAnalytics(rows);
 
     // Optional: filter by ?month=2026-05
     const { month } = req.query;
@@ -331,9 +320,11 @@ router.get("/analytics/daily", requireAuth, async (req, res) => {
 
 // ─── GET /api/expenses/analytics/monthly ── monthly breakdown ────────────────
 router.get("/analytics/monthly", requireAuth, async (req, res) => {
+  if (!req.user.sheetId) return res.json({ success: true, monthly: [] });
+
   try {
-    const expenses = await Expense.find({ userId: req.user._id }).lean();
-    const { monthly } = buildAnalytics(expenses);
+    const rows = await getSheetRows(req.user.accessToken, req.user.refreshToken, req.user.sheetId);
+    const { monthly } = buildAnalytics(rows);
     res.json({ success: true, monthly });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -342,9 +333,11 @@ router.get("/analytics/monthly", requireAuth, async (req, res) => {
 
 // ─── GET /api/expenses/analytics/categories ── category breakdown ─────────────
 router.get("/analytics/categories", requireAuth, async (req, res) => {
+  if (!req.user.sheetId) return res.json({ success: true, categories: [] });
+
   try {
-    const expenses = await Expense.find({ userId: req.user._id }).lean();
-    const { categories, topItems } = buildAnalytics(expenses);
+    const rows = await getSheetRows(req.user.accessToken, req.user.refreshToken, req.user.sheetId);
+    const { categories, topItems } = buildAnalytics(rows);
     res.json({ success: true, categories, topItems });
   } catch (err) {
     res.status(500).json({ error: err.message });

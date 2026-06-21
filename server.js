@@ -44,11 +44,12 @@ app.use((req, res, next) => {
   next();
 });
 
+
 app.use("/auth", authRoutes);
 app.use("/api/expenses", expenseRoutes);
 app.get("/health", (req, res) => res.json({ status: "ok", version: "2.0.0" }));
 cron.schedule(
-  "0 20 * * *",
+  "0 21 * * *",
   async () => {
     console.log("Running daily expense report job...");
     try {
