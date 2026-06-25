@@ -13,7 +13,33 @@ function buildTodaySummary(expenses, todayStr) {
   return { todayStr, todayEntries, total };
 }
 
-function formatMessage({ todayStr, todayEntries, total }) {
+// Category names are always stored in English (see extractExpenseFromText),
+// so a small lookup table is enough to localize them for the Tamil report —
+// no translation API call needed.
+const CATEGORY_TA = {
+  "Food & Drink": "உணவு",
+  Transport: "போக்குவரத்து",
+  Shopping: "ஷாப்பிங்",
+  Bills: "பில்கள்",
+  Entertainment: "பொழுதுபோக்கு",
+  Health: "சுகாதாரம்",
+  Education: "கல்வி",
+  Other: "மற்றவை",
+};
+
+function formatMessage({ todayStr, todayEntries, total }, lang = "en") {
+  if (lang === "ta") {
+    if (todayEntries.length === 0) {
+      return `📊 *தினசரி செலவு அறிக்கை — ${todayStr}*\n\nஇன்று செலவுகள் எதுவும் பதிவு செய்யப்படவில்லை. 🎉`;
+    }
+
+    const lines = todayEntries
+      .map((e) => `• ${e.item} — ₹${e.amount} (${CATEGORY_TA[e.category] || e.category})`)
+      .join("\n");
+
+    return `📊 *தினசரி செலவு அறிக்கை — ${todayStr}*\n\n${lines}\n\n*மொத்தம்: ₹${total}*\n_இன்று ${todayEntries.length} பரிவர்த்தனை(கள்)_`;
+  }
+
   if (todayEntries.length === 0) {
     return `📊 *Daily Expense Report — ${todayStr}*\n\nNo expenses logged today. 🎉`;
   }
@@ -30,14 +56,12 @@ export async function sendDailyReportForUser(user) {
     timeZone: "Asia/Kolkata", day: "2-digit", month: "2-digit", year: "numeric",
   });
 
-  // Mongo query replaces the live Sheets read — filters directly by
-  // userId + date instead of pulling every row and filtering in JS.
   const todayExpenses = await Expense.find({ userId: user._id, date: todayStr }).lean();
 
   if (!todayExpenses.length) return;
 
   const summary = buildTodaySummary(todayExpenses, todayStr);
-  const message = formatMessage(summary);
+  const message = formatMessage(summary, user.language || "en");
 
   try {
     await axios.post(
@@ -49,7 +73,7 @@ export async function sendDailyReportForUser(user) {
       },
       { headers: { "X-Api-Key": process.env.WHATSCALE_API_KEY } }
     );
-    console.log(`Daily report sent for ${user.email}`);
+    console.log(`Daily report sent for ${user.email} (${user.language || "en"})`);
   } catch (err) {
     console.log("WHATSCALE ERROR STATUS:", err.response?.status);
     console.log("WHATSCALE ERROR BODY:", JSON.stringify(err.response?.data));

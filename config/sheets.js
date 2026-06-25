@@ -29,7 +29,6 @@ async function findExpensesTab(sheets, spreadsheetId) {
   const titles = meta.data.sheets.map((s) => s.properties.title);
   console.log("Existing tabs:", titles);
 
-  // Priority: Expenses > Sheet1 > first tab
   if (titles.includes("Expenses")) return "Expenses";
   if (titles.includes("Sheet1")) return "Sheet1";
   return titles[0];
@@ -51,7 +50,6 @@ async function ensureSummaryTab(sheets, spreadsheetId) {
 
 // ─── Build summary data from raw rows ────────────────────────────────────────
 function buildSummaryData(rows) {
-  // Skip header row, filter valid rows
   const data = rows.slice(1).map((row) => ({
     date: row[0] || "",
     item: row[1] || "",
@@ -70,7 +68,6 @@ function buildSummaryData(rows) {
   const todayTotal = data.filter((r) => r.date === todayStr).reduce((s, r) => s + r.amount, 0);
   const allTimeTotal = data.reduce((s, r) => s + r.amount, 0);
 
-  // This week
   const startOfWeek = new Date(now);
   const day = now.getDay();
   startOfWeek.setDate(now.getDate() - (day === 0 ? 6 : day - 1));
@@ -80,14 +77,12 @@ function buildSummaryData(rows) {
     return d && d >= startOfWeek;
   }).reduce((s, r) => s + r.amount, 0);
 
-  // This month
   const monthTotal = data.filter((r) => {
     const d = parseDate(r.date);
     if (!d) return false;
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}` === thisMonthKey;
   }).reduce((s, r) => s + r.amount, 0);
 
-  // Last month
   const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
   const lastMonthKey = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, "0")}`;
   const lastMonthTotal = data.filter((r) => {
@@ -96,7 +91,6 @@ function buildSummaryData(rows) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}` === lastMonthKey;
   }).reduce((s, r) => s + r.amount, 0);
 
-  // Category breakdown this month
   const categoryMap = {};
   data.filter((r) => {
     const d = parseDate(r.date);
@@ -107,7 +101,6 @@ function buildSummaryData(rows) {
   });
   const categories = Object.entries(categoryMap).sort((a, b) => b[1] - a[1]);
 
-  // Top items all time
   const itemMap = {};
   data.forEach(({ item, amount }) => {
     if (!item) return;
@@ -118,7 +111,6 @@ function buildSummaryData(rows) {
   });
   const topItems = Object.values(itemMap).sort((a, b) => b.total - a.total).slice(0, 5);
 
-  // Daily totals this month
   const dailyMap = {};
   data.filter((r) => {
     const d = parseDate(r.date);
@@ -131,7 +123,6 @@ function buildSummaryData(rows) {
     .sort((a, b) => (parseDate(b[0]) || 0) - (parseDate(a[0]) || 0))
     .slice(0, 10);
 
-  // Monthly history
   const monthlyMap = {};
   data.forEach(({ date, amount }) => {
     const d = parseDate(date);
@@ -205,7 +196,6 @@ async function updateSummarySheet(sheets, spreadsheetId, summaryData) {
       : [["No data yet", "", ""]]),
   ];
 
-  // Clear old content first
   await sheets.spreadsheets.values.clear({
     spreadsheetId,
     range: "Summary!A1:D100",
@@ -222,6 +212,11 @@ async function updateSummarySheet(sheets, spreadsheetId, summaryData) {
 }
 
 // ─── Create user sheet on signup ──────────────────────────────────────────────
+// IMPORTANT for the OAuth scope change in auth.js: this function creates the
+// spreadsheet via sheets.spreadsheets.create(). A file created through the
+// Sheets API while the app holds the "drive.file" grant is automatically
+// accessible to the app afterward — that's the whole point of drive.file.
+// No code change needed here for the scope change to work.
 export async function createUserSheet(accessToken, refreshToken, userName) {
   const auth = getOAuthClient(accessToken, refreshToken);
   const sheets = google.sheets({ version: "v4", auth });
@@ -249,7 +244,6 @@ export async function createUserSheet(accessToken, refreshToken, userName) {
     },
   });
 
-  // Write empty summary
   await updateSummarySheet(sheets, sheetId, buildSummaryData([
     ["Date", "Item", "Category", "Amount (Rs)", "Original Text", "Logged At"],
   ]));
@@ -259,15 +253,16 @@ export async function createUserSheet(accessToken, refreshToken, userName) {
 }
 
 // ─── Append expense + refresh summary ────────────────────────────────────────
+// Returns { row, rowNumber, sheetGid } so the caller (saveExpenseAndSync) can
+// store rowNumber/sheetGid on the Mongo document — needed later to delete or
+// patch this exact row in the spreadsheet.
 export async function appendExpenseRow(accessToken, refreshToken, sheetId, data) {
   const auth = getOAuthClient(accessToken, refreshToken);
   const sheets = google.sheets({ version: "v4", auth });
 
-  // Find correct tab (Sheet1 or Expenses)
   const expensesTab = await findExpensesTab(sheets, sheetId);
   console.log(`Using tab: ${expensesTab}`);
 
-  // Ensure Summary tab exists
   await ensureSummaryTab(sheets, sheetId);
 
   const row = [
@@ -279,15 +274,25 @@ export async function appendExpenseRow(accessToken, refreshToken, sheetId, data)
     new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
   ];
 
-  // Append to expense tab
-  await sheets.spreadsheets.values.append({
+  const appendRes = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: `${expensesTab}!A:F`,
     valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
     requestBody: { values: [row] },
   });
 
-  // Read ALL rows from expense tab to build summary
+  // The API returns the range it actually wrote to, e.g. "Expenses!A42:F42" —
+  // parse the row number out of that so we can target this row later.
+  const updatedRange = appendRes.data.updates?.updatedRange || "";
+  const rowMatch = updatedRange.match(/![A-Z]+(\d+):/);
+  const rowNumber = rowMatch ? parseInt(rowMatch[1], 10) : null;
+
+  // sheetGid is the numeric tab id batchUpdate needs (not the tab name).
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+  const tabMeta = meta.data.sheets.find((s) => s.properties.title === expensesTab);
+  const sheetGid = tabMeta ? tabMeta.properties.sheetId : null;
+
   const allRows = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
     range: `${expensesTab}!A:F`,
@@ -296,7 +301,83 @@ export async function appendExpenseRow(accessToken, refreshToken, sheetId, data)
   const summaryData = buildSummaryData(allRows.data.values || []);
   await updateSummarySheet(sheets, sheetId, summaryData);
 
-  return row;
+  return { row, rowNumber, sheetGid, tabName: expensesTab };
+}
+
+// ─── Delete a specific row from the Expenses tab + refresh summary ──────────
+// IMPORTANT: deleting a row shifts every row below it up by one. The caller
+// (expenses.js) MUST re-sync sheetRowNumber for all other synced expenses
+// belonging to this user after calling this — see resyncRowNumbersAfterDelete
+// below, or the next delete/edit will target the wrong row.
+export async function deleteExpenseRow(accessToken, refreshToken, sheetId, sheetGid, rowNumber) {
+  const auth = getOAuthClient(accessToken, refreshToken);
+  const sheets = google.sheets({ version: "v4", auth });
+
+  if (sheetGid == null || rowNumber == null) {
+    throw new Error("Missing sheetGid or rowNumber — cannot locate row to delete.");
+  }
+
+  // deleteDimension uses 0-indexed, half-open ranges: to delete spreadsheet
+  // row N (1-indexed, as shown in the UI), startIndex is N-1 and endIndex is N.
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: sheetId,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: sheetGid,
+              dimension: "ROWS",
+              startIndex: rowNumber - 1,
+              endIndex: rowNumber,
+            },
+          },
+        },
+      ],
+    },
+  });
+
+  console.log(`✅ Deleted row ${rowNumber} from sheet ${sheetId}`);
+
+  // Refresh the Summary tab so totals reflect the deletion immediately.
+  const expensesTab = await findExpensesTab(sheets, sheetId);
+  const allRows = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${expensesTab}!A:F`,
+  });
+  const summaryData = buildSummaryData(allRows.data.values || []);
+  await updateSummarySheet(sheets, sheetId, summaryData);
+}
+
+// ─── Update a specific row's values in place + refresh summary ──────────────
+export async function updateExpenseRow(accessToken, refreshToken, sheetId, sheetGid, rowNumber, data) {
+  const auth = getOAuthClient(accessToken, refreshToken);
+  const sheets = google.sheets({ version: "v4", auth });
+
+  if (rowNumber == null) {
+    throw new Error("Missing rowNumber — cannot locate row to update.");
+  }
+
+  const expensesTab = await findExpensesTab(sheets, sheetId);
+
+  // Only overwrite Date/Item/Category/Amount (columns A:D) — leave the
+  // original transcript and logged-at timestamp (E:F) untouched, since
+  // those describe how/when it was originally captured, not its current value.
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `${expensesTab}!A${rowNumber}:D${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[data.date, data.item, data.category, data.amount]] },
+  });
+
+  console.log(`✅ Updated row ${rowNumber} in sheet ${sheetId}`);
+
+  const allRows = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${expensesTab}!A:F`,
+  });
+  const summaryData = buildSummaryData(allRows.data.values || []);
+  await updateSummarySheet(sheets, sheetId, summaryData);
 }
 
 // ─── Get all expense rows ─────────────────────────────────────────────────────

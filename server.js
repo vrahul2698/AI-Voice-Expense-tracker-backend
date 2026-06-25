@@ -12,6 +12,7 @@ console.log("MONGODB_URI:", process.env.MONGODB_URI ? "✅ loaded" : "❌ MISSIN
 console.log("JWT_SECRET:", process.env.JWT_SECRET ? "✅ loaded" : "❌ MISSING");
 console.log("SESSION_SECRET:", process.env.SESSION_SECRET ? "✅ loaded" : "❌ MISSING");
 console.log("=================");
+console.log("Groq Key:", process.env.GROQ_API_KEY);
 
 import express from "express";
 import cors from "cors";
