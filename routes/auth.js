@@ -43,8 +43,14 @@ router.get(
 
 // ─── Get current user ─────────────────────────────────────────────────────────
 router.get("/me", requireAuth, async (req, res) => {
-  const { _id, name, email, avatar, sheetId, sheetUrl, totalExpenses, totalAmount, language, createdAt } = req.user;
-  res.json({ _id, name, email, avatar, sheetId, sheetUrl, totalExpenses, totalAmount, language, createdAt });
+  const {
+    _id, name, email, avatar, sheetId, sheetUrl, totalExpenses, totalAmount,
+    language, whatsappNumber, remindersEnabled, summaryEnabled, createdAt,
+  } = req.user;
+  res.json({
+    _id, name, email, avatar, sheetId, sheetUrl, totalExpenses, totalAmount,
+    language, whatsappNumber, remindersEnabled, summaryEnabled, createdAt,
+  });
 });
 
 // ─── Update language preference (English / Tamil) ────────────────────────────
@@ -57,6 +63,35 @@ router.patch("/language", requireAuth, async (req, res) => {
   req.user.language = language;
   await req.user.save();
   res.json({ success: true, language: req.user.language });
+});
+
+// ─── Update WhatsApp number + reminder/summary toggles ───────────────────────
+// whatsappNumber must be digits only, with country code, no "+" or spaces
+// (e.g. "919876543210") — this is what gets turned into "<number>@c.us" for
+// WhatScale. Pass null/"" to clear it and turn off both messages.
+router.patch("/whatsapp", requireAuth, async (req, res) => {
+  const { whatsappNumber, remindersEnabled, summaryEnabled } = req.body;
+
+  if (whatsappNumber !== undefined) {
+    if (whatsappNumber === null || whatsappNumber === "") {
+      req.user.whatsappNumber = null;
+    } else if (!/^\d{10,15}$/.test(whatsappNumber)) {
+      return res.status(400).json({ error: "whatsappNumber must be digits only with country code, e.g. 919876543210" });
+    } else {
+      req.user.whatsappNumber = whatsappNumber;
+    }
+  }
+
+  if (remindersEnabled !== undefined) req.user.remindersEnabled = !!remindersEnabled;
+  if (summaryEnabled !== undefined) req.user.summaryEnabled = !!summaryEnabled;
+
+  await req.user.save();
+  res.json({
+    success: true,
+    whatsappNumber: req.user.whatsappNumber,
+    remindersEnabled: req.user.remindersEnabled,
+    summaryEnabled: req.user.summaryEnabled,
+  });
 });
 
 // ─── Retry sheet creation (if it failed at signup) ───────────────────────────
